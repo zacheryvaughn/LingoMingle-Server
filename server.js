@@ -12,16 +12,17 @@ server.listen(PORT, () => {
 // CORS setup for Socket.IO
 const io = new Server(server, {
   cors: {
-    origin: ["http://127.0.0.1:5500", "https://lingomingle.com"],
+    // origin: ["http://127.0.0.1:5500", "https://lingomingle.com"],
+    origin: ["http://127.0.0.1:5500"],
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
 // Redirect the root route to your frontend domain
-app.get('/', (req, res) => {
-  res.redirect('https://lingomingle.com');
-});
+// app.get('/', (req, res) => {
+//   res.redirect('https://lingomingle.com');
+// });
 
 const waitingUsers = new Set();
 const userPairs = new Map();
@@ -34,7 +35,7 @@ function cleanUp() {
   let removedRooms = 0;
 
   // Clean up waitingUsers
-  waitingUsers.forEach(userId => {
+  waitingUsers.forEach((userId) => {
     if (!connectedSocketIds.has(userId)) {
       waitingUsers.delete(userId);
       removedWaitingUsers++;
@@ -49,7 +50,7 @@ function cleanUp() {
     }
   });
 
-  toRemoveFromUserPairs.forEach(userId => {
+  toRemoveFromUserPairs.forEach((userId) => {
     if (userPairs.delete(userId)) {
       removedPairs++;
     }
@@ -57,7 +58,9 @@ function cleanUp() {
 
   // Clean up privateRooms
   privateRooms.forEach((users, roomId) => {
-    const connectedUsers = users.filter(userId => connectedSocketIds.has(userId));
+    const connectedUsers = users.filter((userId) =>
+      connectedSocketIds.has(userId)
+    );
     if (connectedUsers.length === 0) {
       privateRooms.delete(roomId);
       removedRooms++;
@@ -68,10 +71,13 @@ function cleanUp() {
 
   // Log cleanup details
   if (removedWaitingUsers > 0 || removedPairs > 0 || removedRooms > 0) {
-    console.log(`Cleanup completed: ${removedWaitingUsers} waitingUsers removed, ${removedPairs / 2} pairs removed, ${removedRooms} empty rooms removed.`);
-  };
-};
-setInterval(cleanUp, 1000);
+    console.log(
+      `Cleanup completed: ${removedWaitingUsers} waitingUsers removed, ${removedPairs / 2
+      } pairs removed, ${removedRooms} empty rooms removed.`
+    );
+  }
+}
+setInterval(cleanUp, 10000);
 
 function pairUsers() {
   function shuffleArray(array) {
@@ -100,6 +106,8 @@ function pairUsers() {
         user2Socket.join(roomName);
 
         io.to(roomName).emit("paired", { roomName, user1Id, user2Id });
+        io.to(user1Id).emit("initiateCall");
+
         console.log(`Created room: ${roomName} with ${user1Id} and ${user2Id}`);
 
         userPairs.set(user1Id, user2Id);
@@ -175,22 +183,28 @@ function sendMessageToPartner(senderId, message) {
 
   if (isInPrivateRoom && roomIdToSend) {
     // If the sender is in a private room, emit the message to the other user in the room
-    io.to(roomIdToSend).emit('messageFromServer', { sender: senderId, text: message });
+    io.to(roomIdToSend).emit("messageFromServer", {
+      sender: senderId,
+      text: message,
+    });
   } else if (userPairs.has(senderId)) {
     // If the sender is randomly paired, emit the message to the paired user
     const partnerId = userPairs.get(senderId);
-    io.to(partnerId).emit('messageFromServer', { sender: senderId, text: message });
+    io.to(partnerId).emit("messageFromServer", {
+      sender: senderId,
+      text: message,
+    });
   }
 }
 
 io.on("connection", (socket) => {
-  socket.emit('yourId', socket.id);
+  socket.emit("yourId", socket.id);
   console.log("--Connected:", socket.id);
-  io.emit('onlineUsers', io.engine.clientsCount);
+  io.emit("onlineUsers", io.engine.clientsCount);
 
   socket.on("disconnect", () => {
     console.log("--Disconnected:", socket.id);
-    io.emit('onlineUsers', io.engine.clientsCount);
+    io.emit("onlineUsers", io.engine.clientsCount);
     waitingUsers.delete(socket.id);
     if (userPairs.has(socket.id)) {
       unpairUsers(socket.id);
@@ -212,7 +226,7 @@ io.on("connection", (socket) => {
     socket.emit("unpaired");
   });
 
-  socket.on('skipRequest', () => {
+  socket.on("skipRequest", () => {
     skipUsers(socket.id);
   });
 
@@ -221,28 +235,47 @@ io.on("connection", (socket) => {
     if (!privateRooms.has(roomId) && roomId.length > 6) {
       privateRooms.set(roomId, [socket.id]);
       socket.join(roomId);
-      socket.emit("enteredPrivateRoom", { roomId });
+      socket.emit("privateRoomCreated", { roomId });
     } else {
       socket.emit("roomError", "Room already exists or invalid ID");
     }
   });
 
   socket.on("joinPrivateRoom", (roomId) => {
-    if (privateRooms.has(roomId) && privateRooms.get(roomId).length < 2) {
-      privateRooms.get(roomId).push(socket.id);
-      socket.join(roomId);
-      // Notify both users in the room
-      io.to(roomId).emit("enteredPrivateRoom", { roomId });
+    if (privateRooms.has(roomId)) {
+      const roomParticipants = privateRooms.get(roomId);
+
+      if (roomParticipants.length < 2) {
+        roomParticipants.push(socket.id);
+        socket.join(roomId);
+
+        // If the room now has two participants
+        if (roomParticipants.length === 2) {
+          const [user1Id, user2Id] = roomParticipants; // Assuming the first element is the existing user
+
+          // Emit to the room, all participants get the same message
+          io.to(roomId).emit("pairedInPrivateRoom", { roomId, user1Id, user2Id });
+          io.to(user1Id).emit("initiateCall");
+
+          console.log(`Both users are now in room: ${roomId}`);
+        } else {
+          // Notify the single user that they are waiting for a partner
+          socket.emit("waitingForPartner", { roomId });
+        }
+      } else {
+        socket.emit("roomError", "Room is already full");
+      }
     } else {
-      socket.emit("roomError", "Room full or does not exist");
+      socket.emit("roomError", "Room does not exist");
     }
   });
+
 
   socket.on("leavePrivateRoom", () => {
     // Find and leave the private room
     for (let [roomId, users] of privateRooms.entries()) {
       if (users.includes(socket.id)) {
-        users.forEach(userId => {
+        users.forEach((userId) => {
           io.to(userId).emit("unpaired");
           io.sockets.sockets.get(userId).leave(roomId);
         });
@@ -253,7 +286,26 @@ io.on("connection", (socket) => {
   });
 
   // Run message emit function when message is received from client.
-  socket.on('messageFromClient', (message) => {
+  socket.on("messageFromClient", (message) => {
     sendMessageToPartner(socket.id, message);
   });
+
+  // Relaying the WebRTC offer
+  socket.on('sendOffer', data => {
+    console.log(`Relaying offer from ${socket.id} to ${data.to}`);
+    socket.to(data.to).emit('receiveOffer', { offer: data.offer, from: socket.id });
+  });
+
+  // Relaying the WebRTC answer
+  socket.on('sendAnswer', data => {
+    console.log(`Relaying answer from ${socket.id} to ${data.to}`);
+    socket.to(data.to).emit('receiveAnswer', { answer: data.answer });
+  });
+
+  // Relaying ICE candidates
+  socket.on('sendCandidate', data => {
+    console.log(`Relaying ICE candidate from ${socket.id} to ${data.to}`);
+    socket.to(data.to).emit('receiveCandidate', { candidate: data.candidate });
+  });
+
 });
