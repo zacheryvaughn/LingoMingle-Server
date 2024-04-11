@@ -12,17 +12,17 @@ server.listen(PORT, () => {
 // CORS setup for Socket.IO
 const io = new Server(server, {
   cors: {
-    // origin: ["http://127.0.0.1:5500", "https://lingomingle.com"],
-    origin: ["http://127.0.0.1:5500"],
+    origin: ["http://127.0.0.1:5500", "https://lingomingle.com"],
+    // origin: ["http://127.0.0.1:5500"],
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
 // Redirect the root route to your frontend domain
-// app.get('/', (req, res) => {
-//   res.redirect('https://lingomingle.com');
-// });
+app.get('/', (req, res) => {
+  res.redirect('https://lingomingle.com');
+});
 
 const waitingUsers = new Set();
 const userPairs = new Map();
