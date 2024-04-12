@@ -86,18 +86,18 @@ io.on("connection", (socket) => {
   console.log("--Connected:", socket.id);
   io.emit("onlineUsers", onlineUsers.size);
 
-  const intervalId = setInterval(() => {
-    socket.emit("heartbeat", { message: "ping", time: Date.now() });
-  }, 30000);  // Send heartbeat every 30 seconds
-
-  socket.on("heartbeat", (data) => {
-    console.log(`Heartbeat received back from ${socket.id} with message: ${data.message}`);
+  socket.on("heartbeat", () => {
+    console.log("PONG received from client");
   });
 
-  socket.on("disconnect", () => {
-    onlineUsers.delete(socket.id);
+  const intervalId = setInterval(() => {
+    socket.emit("heartbeat", "PING");  // Send a "PING" message to the client
+  }, 30000);
 
-    clearInterval(intervalId);
+
+  socket.on("disconnect", () => {
+    clearInterval(intervalId);  // Clear the interval on disconnect
+    onlineUsers.delete(socket.id);
     console.log("--Disconnected:", socket.id);
     io.emit("onlineUsers", onlineUsers.size);
     waitingUsers.delete(socket.id);
