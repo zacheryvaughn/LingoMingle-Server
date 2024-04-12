@@ -27,6 +27,7 @@ app.get('/', (req, res) => {
 const waitingUsers = new Set();
 const userPairs = new Map();
 const privateRooms = new Map();
+const onlineUsers = new Set();
 
 function cleanUp() {
   const connectedSocketIds = new Set(Array.from(io.sockets.sockets.keys()));
@@ -82,11 +83,13 @@ setInterval(cleanUp, 10000);
 io.on("connection", (socket) => {
   socket.emit("yourId", socket.id);
   console.log("--Connected:", socket.id);
-  io.emit("onlineUsers", io.engine.clientsCount);
+  onlineUsers.add(socket.id);
+  io.emit("onlineUsers", onlineUsers.size);
 
   socket.on("disconnect", () => {
     console.log("--Disconnected:", socket.id);
-    io.emit("onlineUsers", io.engine.clientsCount);
+    onlineUsers.delete(socket.id);
+    io.emit("onlineUsers", onlineUsers.size);
     waitingUsers.delete(socket.id);
     if (userPairs.has(socket.id)) {
       unpairUsers(socket.id);
