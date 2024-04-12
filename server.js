@@ -82,13 +82,23 @@ setInterval(cleanUp, 10000);
 
 io.on("connection", (socket) => {
   socket.emit("yourId", socket.id);
-  console.log("--Connected:", socket.id);
   onlineUsers.add(socket.id);
+  console.log("--Connected:", socket.id);
   io.emit("onlineUsers", onlineUsers.size);
 
+  const intervalId = setInterval(() => {
+    socket.emit("heartbeat", { message: "ping", time: Date.now() });
+  }, 30000);  // Send heartbeat every 30 seconds
+
+  socket.on("heartbeat", (data) => {
+    console.log(`Heartbeat received back from ${socket.id} with message: ${data.message}`);
+  });
+
   socket.on("disconnect", () => {
-    console.log("--Disconnected:", socket.id);
     onlineUsers.delete(socket.id);
+
+    clearInterval(intervalId);
+    console.log("--Disconnected:", socket.id);
     io.emit("onlineUsers", onlineUsers.size);
     waitingUsers.delete(socket.id);
     if (userPairs.has(socket.id)) {
