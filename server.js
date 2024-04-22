@@ -1,211 +1,324 @@
-////////////////////////////////////////////////////////////////////////////////////
-// DEPENDENCIES AND ROUTING ////////////////////////////////////////////////////////
 const express = require("express");
 const app = express();
 const http = require("http");
 const server = http.createServer(app);
 const { Server } = require("socket.io");
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// CORS setup for Socket.IO
 const io = new Server(server, {
   cors: {
-    // origin: ["http://127.0.0.1:5500", "https://ludo.lingomingle.com"],
-    origin: ["http://127.0.0.1:5501"],
+    origin: ["http://127.0.0.1:5500", "https://lingomingle.com"],
+    // origin: ["http://127.0.0.1:5500"],
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
+
+// Redirect the root route to your frontend domain
 app.get('/', (req, res) => {
-  res.redirect("http://127.0.0.1:5501");
+  res.redirect('https://lingomingle.com');
 });
 
-////////////////////////////////////////////////////////////////////////////////////
-// PLAYER AND ROOM LOCATIONS ///////////////////////////////////////////////////////
-const availablePlayers = new Map();
-const queuedPlayers = new Map();
-const publicLobbies = new Map();
-const privateLobbies = new Map();
+const waitingUsers = new Set();
+const userPairs = new Map();
+const privateRooms = new Map();
+const onlineUsers = new Set();
 
-////////////////////////////////////////////////////////////////////////////////////
-// CONNECTION SIGNALS //////////////////////////////////////////////////////////////
+function cleanUp() {
+  const connectedSocketIds = new Set(Array.from(io.sockets.sockets.keys()));
+  let removedWaitingUsers = 0;
+  let removedPairs = 0;
+  let removedRooms = 0;
+
+  // Clean up waitingUsers
+  waitingUsers.forEach((userId) => {
+    if (!connectedSocketIds.has(userId)) {
+      waitingUsers.delete(userId);
+      removedWaitingUsers++;
+    }
+  });
+
+  // Clean up userPairs
+  const toRemoveFromUserPairs = [];
+  userPairs.forEach((partnerId, userId) => {
+    if (!connectedSocketIds.has(userId) || !connectedSocketIds.has(partnerId)) {
+      toRemoveFromUserPairs.push(userId, partnerId);
+    }
+  });
+
+  toRemoveFromUserPairs.forEach((userId) => {
+    if (userPairs.delete(userId)) {
+      removedPairs++;
+    }
+  });
+
+  // Clean up privateRooms
+  privateRooms.forEach((users, roomId) => {
+    const connectedUsers = users.filter((userId) =>
+      connectedSocketIds.has(userId)
+    );
+    if (connectedUsers.length === 0) {
+      privateRooms.delete(roomId);
+      removedRooms++;
+    } else if (connectedUsers.length < users.length) {
+      privateRooms.set(roomId, connectedUsers);
+    }
+  });
+
+  // Log cleanup details
+  if (removedWaitingUsers > 0 || removedPairs > 0 || removedRooms > 0) {
+    console.log(
+      `Cleanup completed: ${removedWaitingUsers} waitingUsers removed, ${removedPairs / 2
+      } pairs removed, ${removedRooms} empty rooms removed.`
+    );
+  }
+}
+setInterval(cleanUp, 10000);
+
 io.on("connection", (socket) => {
-  availablePlayers.set(socket.id, { nickname: "Anonymous", desiredPlayers: 4, playerNum: null });
-  console.log("Connected:", socket.id);
+  socket.emit("yourId", socket.id);
+  onlineUsers.add(socket.id);
+  console.log("--Connected:", socket.id);
+  io.emit("onlineUsers", onlineUsers.size);
+
+  socket.on("heartbeat", () => {
+    console.log("PONG received from client");
+  });
+
+  const intervalId = setInterval(() => {
+    socket.emit("heartbeat", "PING");  // Send a "PING" message to the client
+  }, 30000);
+
 
   socket.on("disconnect", () => {
-    handleDisconnect(socket.id);
-    if (availablePlayers.has(socket.id)) {
-      availablePlayers.delete(socket.id);
-      console.log("Disconnected (removed from availablePlayers):", socket.id);
-    }
-    if (queuedPlayers.has(socket.id)) {
-      queuedPlayers.delete(socket.id);
-      console.log("Disconnected (removed from queuedPlayers):", socket.id);
+    clearInterval(intervalId);  // Clear the interval on disconnect
+    onlineUsers.delete(socket.id);
+    console.log("--Disconnected:", socket.id);
+    io.emit("onlineUsers", onlineUsers.size);
+    waitingUsers.delete(socket.id);
+    if (userPairs.has(socket.id)) {
+      unpairUsers(socket.id);
     }
   });
 
-  socket.on("playRequest", (data) => {
-    availablePlayers.delete(socket.id);
-    const nickname = data.nickname || "Anonymous";
-    const desiredPlayers = data.desiredPlayers || 4;
-    queuedPlayers.set(socket.id, { nickname: nickname, desiredPlayers: desiredPlayers, playerNum: null });
-    console.log("Moved to queuedPlayers:", socket.id, { nickname: nickname, desiredPlayers: desiredPlayers, playerNum: null });
-    socket.emit("findingLobby");
+  socket.on("pairRequest", () => {
+    waitingUsers.add(socket.id);
+    socket.emit("waiting");
+    pairUsers();
   });
 
-});
+  socket.on("unpairRequest", () => {
+    unpairUsers(socket.id);
+  });
 
-////////////////////////////////////////////////////////////////////////////////////
-// LOBBY MANAGEMENT ////////////////////////////////////////////////////////////////
-function joinLobby(playerId, lobbyId) {
-  const lobby = publicLobbies.get(lobbyId);
-  if (!lobby) {
-    console.error(`No lobby found with ID: ${lobbyId}`);
-    return; // Fail-safe check
-  }
+  socket.on("unwaitRequest", () => {
+    waitingUsers.delete(socket.id);
+    socket.emit("unpaired");
+  });
 
-  const playerData = queuedPlayers.get(playerId);
-  if (!playerData) {
-    console.error(`No queued player data found for ID: ${playerId}`);
-    return; // Additional fail-safe check
-  }
+  socket.on("skipRequest", () => {
+    skipUsers(socket.id);
+  });
 
-  const playerNum = lobby.members.length + 1;
-  // Store the complete player data in the lobby, including the nickname
-  lobby.members.push({ id: playerId, nickname: playerData.nickname, playerNum: playerNum });
-  lobby.vacantSlots--;
+  socket.on("createPrivateRoom", (roomId) => {
+    // Ensure room doesn't already exist and roomId is valid
+    if (!privateRooms.has(roomId) && roomId.length > 6) {
+      privateRooms.set(roomId, [socket.id]);
+      socket.join(roomId);
+      socket.emit("privateRoomCreated", { roomId });
+    } else {
+      socket.emit("roomError", "Room already exists or invalid ID");
+    }
+  });
 
-  // Player is now fully joined to the lobby, remove from queued players
-  queuedPlayers.delete(playerId);
-  console.log(`Player ${playerId} joined lobby ${lobbyId} as Player ${playerNum}`);
+  socket.on("joinPrivateRoom", (roomId) => {
+    if (privateRooms.has(roomId)) {
+      const roomParticipants = privateRooms.get(roomId);
 
-  // Ensure the player joins the room
-  io.sockets.sockets.get(playerId).join(lobbyId);
+      if (roomParticipants.length < 2) {
+        roomParticipants.push(socket.id);
+        socket.join(roomId);
 
-  // Directly use lobby members to emit details, ensuring all data is accurate
-  const lobbyMembers = lobby.members.map(member => ({
-    nickname: member.nickname,
-    playerNum: member.playerNum
-  }));
+        // If the room now has two participants
+        if (roomParticipants.length === 2) {
+          const [user1Id, user2Id] = roomParticipants; // Assuming the first element is the existing user
 
-  io.to(playerId).emit('inLobby');
-  io.to(lobbyId).emit('updateLobby', lobbyMembers);
+          // Emit to the room, all participants get the same message
+          io.to(roomId).emit("pairedInPrivateRoom", { roomId, user1Id, user2Id });
+          io.to(user1Id).emit("initiateCall");
 
-  if (lobby.vacantSlots === 0) {
-    lobby.inMatch = true;
-    console.log(`Lobby ${lobbyId} is now full. Match will start in 1 second.`);
-    // Delay match start by 1 second
-    setTimeout(() => {
-      io.to(lobbyId).emit('matchStarted');
-      console.log(`Match started in lobby ${lobbyId}.`);
-    }, 1000); // Delay is 1000 milliseconds
-  }
-};
+          console.log(`Both users are now in room: ${roomId}`);
+        } else {
+          // Notify the single user that they are waiting for a partner
+          socket.emit("waitingForPartner", { roomId });
+        }
+      } else {
+        socket.emit("roomError", "Room is already full");
+      }
+    } else {
+      socket.emit("roomError", "Room does not exist");
+    }
+  });
 
-function createNewLobby(playerId) {
-  const player = queuedPlayers.get(playerId);
-  const lobbyId = `lobby_${Math.random().toString(36).substr(2, 9)}`; // Generate a unique ID
-  const newLobby = {
-    maxPlayers: player.desiredPlayers,
-    vacantSlots: player.desiredPlayers - 1,
-    inMatch: false,
-    members: [{ id: playerId, nickname: player.nickname, playerNum: 1 }]
-  };
 
-  publicLobbies.set(lobbyId, newLobby);
-  // Player data is used up, remove from queue
-  queuedPlayers.delete(playerId);
-  console.log(`New lobby created with ID: ${lobbyId} by player: ${playerId}`);
-
-  // Ensure the player joins the room
-  io.sockets.sockets.get(playerId).join(lobbyId);
-
-  // Emit the player's own data as they are the only member
-  io.to(playerId).emit('inLobby');
-  io.to(lobbyId).emit('updateLobby', [{ nickname: player.nickname, playerNum: 1 }]);
-};
-
-function setupLobby() {
-  queuedPlayers.forEach((_, playerId) => {
-    const player = queuedPlayers.get(playerId);
-    if (!player) return; // No player found in the queue
-
-    const desiredPlayers = player.desiredPlayers;
-    let foundLobby = false;
-
-    for (const [lobbyId, lobby] of publicLobbies) {
-      if (!lobby.inMatch && lobby.vacantSlots > 0 && lobby.maxPlayers === desiredPlayers) {
-        joinLobby(playerId, lobbyId);
-        foundLobby = true;
+  socket.on("leavePrivateRoom", () => {
+    // Find and leave the private room
+    for (let [roomId, users] of privateRooms.entries()) {
+      if (users.includes(socket.id)) {
+        users.forEach((userId) => {
+          io.to(userId).emit("unpaired");
+          io.sockets.sockets.get(userId).leave(roomId);
+        });
+        privateRooms.delete(roomId); // Delete the room once empty
         break;
       }
     }
-
-    if (!foundLobby) {
-      createNewLobby(playerId);
-    }
   });
-};
 
-setInterval(() => {
-  if (queuedPlayers.size > 0) {
-    console.log("Checking queued players for lobby assignment...");
-    setupLobby();
+  // Run message emit function when message is received from client.
+  socket.on("messageFromClient", (message) => {
+    sendMessageToPartner(socket.id, message);
+  });
+
+  // Relaying the WebRTC offer
+  socket.on('sendOffer', data => {
+    console.log(`Relaying offer from ${socket.id} to ${data.to}`);
+    socket.to(data.to).emit('receiveOffer', { offer: data.offer, from: socket.id });
+  });
+
+  // Relaying the WebRTC answer
+  socket.on('sendAnswer', data => {
+    console.log(`Relaying answer from ${socket.id} to ${data.to}`);
+    socket.to(data.to).emit('receiveAnswer', { answer: data.answer });
+  });
+
+  // Relaying ICE candidates
+  socket.on('sendCandidate', data => {
+    console.log(`Relaying ICE candidate from ${socket.id} to ${data.to}`);
+    socket.to(data.to).emit('receiveCandidate', { candidate: data.candidate });
+  });
+
+});
+
+function pairUsers() {
+  function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+      // Pick a remaining element
+      const j = Math.floor(Math.random() * (i + 1));
+      // And swap it with the current element
+      [array[i], array[j]] = [array[j], array[i]];
+    }
   }
-}, 2000);
 
-function handleDisconnect(playerId) {
-  let lobbyIdFound = null;
+  if (waitingUsers.size >= 2) {
+    const usersArray = Array.from(waitingUsers);
+    shuffleArray(usersArray);
 
-  // Find the lobby the player is in, if any
-  for (const [lobbyId, lobby] of publicLobbies) {
-    const memberIndex = lobby.members.findIndex(member => member.id === playerId);
-    if (memberIndex !== -1) {
-      lobbyIdFound = lobbyId;
+    while (usersArray.length >= 2) {
+      const user1Id = usersArray.pop();
+      const user2Id = usersArray.pop();
+
+      const user1Socket = io.sockets.sockets.get(user1Id);
+      const user2Socket = io.sockets.sockets.get(user2Id);
+
+      if (user1Socket && user2Socket) {
+        const roomName = `${user1Id}_${user2Id}`;
+        user1Socket.join(roomName);
+        user2Socket.join(roomName);
+
+        io.to(roomName).emit("paired", { roomName, user1Id, user2Id });
+        io.to(user1Id).emit("initiateCall");
+
+        console.log(`Created room: ${roomName} with ${user1Id} and ${user2Id}`);
+
+        userPairs.set(user1Id, user2Id);
+        userPairs.set(user2Id, user1Id);
+
+        waitingUsers.delete(user1Id);
+        waitingUsers.delete(user2Id);
+      }
+    }
+  }
+}
+
+function unpairUsers(socketId) {
+  if (userPairs.has(socketId)) {
+    const partnerId = userPairs.get(socketId);
+    const roomName = `${socketId}_${partnerId}`;
+
+    [socketId, partnerId].forEach((id) => {
+      const socket = io.sockets.sockets.get(id);
+      if (socket) {
+        socket.leave(roomName);
+        socket.emit(id === socketId ? "unpaired" : "waiting");
+        if (id === partnerId) waitingUsers.add(id);
+      }
+    });
+
+    userPairs.delete(socketId);
+    userPairs.delete(partnerId);
+
+    pairUsers();
+  }
+}
+
+function skipUsers(socketId) {
+  if (userPairs.has(socketId)) {
+    const partnerId = userPairs.get(socketId);
+    const roomName = `${socketId}_${partnerId}`;
+
+    // Prepare both users for re-pairing without emitting 'unpaired'
+    [socketId, partnerId].forEach((userId) => {
+      const userSocket = io.sockets.sockets.get(userId);
+      if (userSocket) {
+        // Ensure users leave their current room to avoid message crossover
+        userSocket.leave(roomName);
+        // Re-add both users to waitingUsers for immediate re-pairing
+        waitingUsers.add(userId);
+        // Notify both users they're being re-paired
+        userSocket.emit("waiting");
+      }
+    });
+
+    // Remove the users from the userPairs map
+    userPairs.delete(socketId);
+    userPairs.delete(partnerId);
+
+    // Attempt to re-pair users including the ones just skipped
+    pairUsers();
+  }
+}
+
+// Function that determined how messages should be routed
+function sendMessageToPartner(senderId, message) {
+  // Check if the sender is in a private room
+  let isInPrivateRoom = false;
+  let roomIdToSend = null;
+  for (let [roomId, users] of privateRooms.entries()) {
+    if (users.includes(senderId)) {
+      isInPrivateRoom = true;
+      roomIdToSend = roomId;
       break;
     }
   }
 
-  if (!lobbyIdFound) {
-    console.log("Player was not in any lobby:", playerId);
-    return; // Player was not in any lobby
+  if (isInPrivateRoom && roomIdToSend) {
+    // If the sender is in a private room, emit the message to the other user in the room
+    io.to(roomIdToSend).emit("messageFromServer", {
+      sender: senderId,
+      text: message,
+    });
+  } else if (userPairs.has(senderId)) {
+    // If the sender is randomly paired, emit the message to the paired user
+    const partnerId = userPairs.get(senderId);
+    io.to(partnerId).emit("messageFromServer", {
+      sender: senderId,
+      text: message,
+    });
   }
-
-  const lobby = publicLobbies.get(lobbyIdFound);
-  if (!lobby) return; // Just a safety check, should not be necessary
-
-  // Filter out the player from the lobby
-  lobby.members.splice(lobby.members.findIndex(member => member.id === playerId), 1);
-  lobby.vacantSlots++;
-
-  // Reassign player numbers to remaining members
-  lobby.members.forEach((member, index) => {
-    member.playerNum = index + 1;
-  });
-
-  if (lobby.inMatch) {
-    console.log(`Player ${playerId} disconnected after match started in lobby ${lobbyIdFound}.`);
-  } else {
-    console.log(`Player ${playerId} disconnected before match started in lobby ${lobbyIdFound}.`);
-    if (lobby.members.length === 0) {
-      // If the lobby is now empty, we might as well delete it
-      publicLobbies.delete(lobbyIdFound);
-      console.log(`Lobby ${lobbyIdFound} is now empty and has been deleted.`);
-    } else {
-      // Reset the match start countdown if it was the last player needed to start the match
-      if (lobby.vacantSlots === 1) {
-        console.log(`Resetting match start countdown for lobby ${lobbyIdFound}.`);
-        // Code to reset the countdown would go here (if applicable)
-      }
-    }
-  }
-
-  // Emit the update to all players in the lobby
-  const lobbyMembers = lobby.members.map(member => ({
-    nickname: member.nickname,
-    playerNum: member.playerNum
-  }));
-  io.to(lobbyIdFound).emit('updateLobby', lobbyMembers);
 }
